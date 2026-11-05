@@ -1,0 +1,3 @@
+psycopg[binary]>=3.2
+anthropic>=0.40
+fastembed>=0.4

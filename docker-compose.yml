@@ -1,0 +1,45 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: transcripts
+      POSTGRES_PASSWORD: transcripts
+      POSTGRES_DB: transcripts
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transcripts"]
+      interval: 3s
+      retries: 20
+
+  worker:
+    build: .
+    command: python worker.py
+    environment: &app-env
+      DATABASE_URL: postgresql://transcripts:transcripts@db:5432/transcripts
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SUMMARIZER: ${SUMMARIZER:-claude}   # "stub" for offline testing
+      EMBEDDER: ${EMBEDDER:-fastembed}    # "stub" for offline testing
+      PYTHONPATH: /app
+    depends_on:
+      db: {condition: service_healthy}
+    restart: unless-stopped
+    volumes:
+      - fastembed-cache:/root/.cache
+
+  # one-off CLI container: docker compose run --rm app python search.py "query"
+  app:
+    build: .
+    profiles: ["tools"]
+    environment: *app-env
+    depends_on:
+      db: {condition: service_healthy}
+    volumes:
+      - .:/app
+      - fastembed-cache:/root/.cache
+
+volumes:
+  pgdata:
+  fastembed-cache:
