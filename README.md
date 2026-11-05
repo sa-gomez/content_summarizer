@@ -26,3 +26,5 @@ chunks, jobs). `--store` reads `DATABASE_URL` (default: the compose db on localh
 point it at any managed Postgres with the pgvector extension to host it.
 Set `SUMMARIZER=stub` / `EMBEDDER=stub` for offline plumbing tests.
 Fixture test: `docker compose run --rm app python tests/ingest_fixture.py`, then `python worker.py --once`.
+
+Full design notes, including how embeddings and hybrid search work: [docs/storage-and-search.md](docs/storage-and-search.md).
