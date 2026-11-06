@@ -7,9 +7,12 @@ Guidance for AI coding agents (and humans) working in this repo.
 **GitHub Issues is the source of truth for tasks:**
 https://github.com/sa-gomez/content_summarizer/issues
 
-Check open issues before starting work, and file new work there rather than in TODO
+Check open issues before starting work, and file new work there rather than in TODO 
 comments or this file. Reference the issue number in branch names and PR descriptions
 (e.g. `Closes #3`).
+
+If you finish a piece of work and spot follow-ups, open
+an issue for each one and say so in the PR.
 
 ## What this project is
 
@@ -17,14 +20,16 @@ Ingests transcripts (YouTube today; podcasts and others planned), stores the raw
 Postgres with metadata, generates LLM summaries of several lengths via background workers,
 and supports hybrid keyword + semantic search. GitHub: https://github.com/sa-gomez/content_summarizer
 
-Design and rationale: [docs/storage-and-search.md](docs/storage-and-search.md). Read it
-before changing the schema, worker or search.
+Designs in docs/ directory
+
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `transcribe.py` | CLI: YouTube URL -> transcript (captions, Whisper fallback). `--store` saves to Postgres. Runs on the host via `uv` (PEP 723 deps). |
+| `transcribe.py` | CLI: URL(s) -> Markdown transcript in `transcripts/`. Runs via `uv` (PEP 723 inline deps, no venv). |
+| `sources.py` | Pluggable non-YouTube sources (`@register`ed classes with `matches` / `resolve`). Apple Podcasts today. |
+| `transcripts/` | Output, one Markdown file per link |
 | `store.py` | Postgres helpers: `connect`, `upsert_document`, `enqueue_job` |
 | `worker.py` | Job worker (`summarize`, `embed`) using `FOR UPDATE SKIP LOCKED` |
 | `search.py` | Hybrid search CLI (keyword + pgvector, reciprocal rank fusion) |
@@ -35,16 +40,38 @@ before changing the schema, worker or search.
 ## Running things
 
 ```
+uv run transcribe.py URL [URL ...]       # YouTube or Apple Podcasts link
+uv run transcribe.py URL --model small   # override the Whisper model
+
 docker compose up -d db worker                      # Postgres + worker
 uv run transcribe.py URL --store                    # ingest (needs uv on the host)
 docker compose run --rm app python search.py "q"    # search
 docker compose run --rm app python worker.py --once # drain the queue and exit
-docker compose down -v                              # tear down AND delete data
+docker compose down -v     
 ```
 
 Env vars: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `SUMMARIZER=stub|claude`,
 `EMBEDDER=stub|fastembed`. Use the stubs for offline plumbing tests; the stub embedder is
 not semantic.
+
+
+## How a link is handled
+
+1. `sources.resolve(url)` asks each registered source whether it claims the URL.
+2. Claimed (e.g. Apple Podcasts): the source returns a `Resolved` (audio URL + metadata);
+   the audio is downloaded and transcribed with Whisper (default model `base`).
+3. Not claimed: treated as YouTube. Captions first; on a missing or failed caption download
+   (e.g. HTTP 429) fall back to Whisper (default model `small`).
+
+To add a source type, add a class to `sources.py` with `matches(url)` and `resolve(url)`,
+decorate it with `@register`, and raise `SourceError` for recognised links that can't be
+resolved. Check open issues first; several source types are already filed.
+
+## Gotchas
+
+- `av` is pinned `<17`: `faster-whisper` 1.2.1 fails with newer PyAV
+  (`open() got an unexpected keyword argument 'metadata_errors'`).
+- YouTube rate-limits caption downloads per video (HTTP 429); the Whisper fallback covers it.
 
 ## Invariants (do not break)
 
@@ -66,3 +93,4 @@ not semantic.
 - Commit messages: short imperative summary, then a body explaining why.
 - Verify changes end to end where you can (ingest -> worker -> search) and state plainly what
   was not tested.
+
