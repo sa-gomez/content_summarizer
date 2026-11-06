@@ -42,12 +42,14 @@ Designs in docs/ directory
 ```
 uv run transcribe.py URL [URL ...]       # YouTube or Apple Podcasts link
 uv run transcribe.py URL --model small   # override the Whisper model
+uv run transcribe.py URL1 URL2 --caption-delay 5   # space out caption requests
+uv run --with pytest --with "yt-dlp[default]" --with faster-whisper --with "av<17" pytest tests
 
 docker compose up -d db worker                      # Postgres + worker
 uv run transcribe.py URL --store                    # ingest (needs uv on the host)
 docker compose run --rm app python search.py "q"    # search
 docker compose run --rm app python worker.py --once # drain the queue and exit
-docker compose down -v     
+docker compose down -v
 ```
 
 Env vars: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `SUMMARIZER=stub|claude`,
@@ -71,7 +73,11 @@ resolved. Check open issues first; several source types are already filed.
 
 - `av` is pinned `<17`: `faster-whisper` 1.2.1 fails with newer PyAV
   (`open() got an unexpected keyword argument 'metadata_errors'`).
-- YouTube rate-limits caption downloads per video (HTTP 429); the Whisper fallback covers it.
+- YouTube rate-limits caption downloads per video (HTTP 429). `get_captions_with_retry()` retries 429/5xx
+  (up to 4 retries, exponential backoff + jitter, honours `Retry-After`, 60s total cap) before falling back
+  to Whisper; non-transient errors don't retry. Multi-URL runs wait `--caption-delay` seconds (default 3,
+  plus jitter, growing after a 429) between caption requests. yt-dlp only *warns* on a failed subtitle
+  download, so `get_captions()` captures warnings via a logger to detect it. Tests live in `tests/`.
 
 ## Invariants (do not break)
 
