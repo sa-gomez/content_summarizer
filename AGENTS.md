@@ -4,12 +4,12 @@ Guidance for AI coding agents (and humans) working in this repo.
 
 ## Where the work is tracked
 
-**Linear is the source of truth for tasks:**
-https://linear.app/sagomez-projects/project/content-summarizer-b3d7dbf29c0e/overview
+**GitHub Issues is the source of truth for tasks:**
+https://github.com/sa-gomez/content_summarizer/issues
 
-Check the project for open issues before starting work, and put new work there rather than
-in TODO comments or this file. Reference the Linear issue ID in branch names and PR
-descriptions.
+Check open issues before starting work, and file new work there rather than in TODO
+comments or this file. Reference the issue number in branch names and PR descriptions
+(e.g. `Closes #3`).
 
 ## What this project is
 
