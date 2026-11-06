@@ -22,4 +22,6 @@ Dependencies are declared at the top of `transcribe.py` (PEP 723); `uv run`
 builds a cached environment from them on first use, so there is no venv to
 create or activate. Install uv: https://docs.astral.sh/uv/
 
-Adding a new kind of link: see `sources.py` (and `TODO.md` for planned ones).
+Adding a new kind of link: see `sources.py` and `AGENTS.md`. Planned work (more
+source types, benchmarks, etc.) is tracked in
+[GitHub Issues](https://github.com/sa-gomez/content_summarizer/issues).

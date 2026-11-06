@@ -2,7 +2,7 @@
 
 A source turns a URL into a `Resolved` episode: a direct audio URL plus
 metadata. To add a new source type, write a class with `matches(url)` and
-`resolve(url)`, and decorate it with `@register`. See TODO.md for planned ones.
+`resolve(url)`, and decorate it with `@register`. Planned source types are tracked in GitHub Issues.
 
 transcribe.py asks `resolve(url)`; if it returns None, the URL is treated as
 a YouTube link (handled by yt-dlp).
