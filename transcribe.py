@@ -16,10 +16,12 @@ Default Whisper model: 'small' for YouTube, 'base' for podcasts (faster; long au
 """
 import argparse
 import json
+import random
 import re
 import shutil
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -42,8 +44,132 @@ def fmt_ts(sec):
     return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
+# Caption retry budget (issue #24). Delays: 2s, 4s, 8s, 16s (+ jitter), capped in total.
+CAPTION_RETRIES = 4
+CAPTION_BACKOFF_BASE = 2.0
+CAPTION_MAX_TOTAL_WAIT = 60.0
+DEFAULT_CAPTION_DELAY = 3.0
+
+_TRANSIENT_RE = re.compile(r"HTTP Error (429|5\d\d)|Too Many Requests", re.I)
+
+
+class CaptionTransientError(Exception):
+    """A caption download failed in a way worth retrying (HTTP 429 / 5xx)."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _is_429(exc):
+    return bool(re.search(r"429|Too Many Requests", str(exc), re.I))
+
+
+def classify_error(exc):
+    """Return (transient, retry_after_seconds|None) for an exception from yt-dlp."""
+    if isinstance(exc, CaptionTransientError):
+        return True, exc.retry_after
+    # Walk the chain: yt-dlp wraps urllib/HTTP errors in DownloadError.
+    seen, cur = set(), exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        candidates = [cur]
+        exc_info = getattr(cur, "exc_info", None)
+        if exc_info and len(exc_info) > 1 and isinstance(exc_info[1], BaseException):
+            candidates.append(exc_info[1])
+        for c in candidates:
+            status = getattr(c, "status", None) or getattr(c, "code", None)
+            if isinstance(status, int) and (status == 429 or 500 <= status < 600):
+                headers = getattr(c, "headers", None) or getattr(getattr(c, "response", None), "headers", None)
+                ra = headers.get("Retry-After") if headers is not None and hasattr(headers, "get") else None
+                try:
+                    return True, float(ra) if ra is not None else None
+                except (TypeError, ValueError):
+                    return True, None
+        cur = cur.__cause__ or cur.__context__
+    if _TRANSIENT_RE.search(str(exc)):
+        return True, None
+    return False, None
+
+
+class _WarningLog:
+    """yt-dlp logger that remembers warnings. Failed subtitle downloads are only
+    warnings in yt-dlp, so this is how we see an HTTP 429 on the caption endpoint."""
+
+    def __init__(self):
+        self.warnings = []
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        self.warnings.append(str(msg))
+
+    def error(self, msg):
+        self.warnings.append(str(msg))
+
+
+class Throttle:
+    """Minimum jittered delay between caption requests; grows after a 429."""
+
+    def __init__(self, delay, sleep=time.sleep):
+        self.delay, self.penalty, self.sleep = delay, 0.0, sleep
+        self.started = False
+
+    def wait(self):
+        if self.started and (self.delay > 0 or self.penalty > 0):
+            d = (self.delay + self.penalty) * random.uniform(1.0, 1.5)
+            print(f"  waiting {d:.1f}s before caption request", file=sys.stderr)
+            self.sleep(d)
+        self.started = True
+
+    def rate_limited(self):
+        self.penalty = min(max(self.penalty * 2, self.delay or 2.0), 60.0)
+
+
+def get_captions_with_retry(url, lang, tmp, throttle=None, fetch=None, sleep=time.sleep,
+                            retries=CAPTION_RETRIES, max_total_wait=CAPTION_MAX_TOTAL_WAIT):
+    """get_captions() with backoff on transient errors (429/5xx).
+
+    Non-transient errors propagate immediately. If the retry budget (attempts or
+    total wait) is spent, the last transient error is raised so the caller can
+    fall back to Whisper.
+    """
+    fetch = fetch or get_captions
+    if throttle:
+        throttle.wait()
+    waited = 0.0
+    for attempt in range(retries + 1):
+        try:
+            return fetch(url, lang, tmp)
+        except Exception as e:
+            transient, retry_after = classify_error(e)
+            if not transient:
+                raise
+            if throttle and _is_429(e):
+                throttle.rate_limited()
+            if attempt >= retries:
+                raise
+            delay = retry_after if retry_after is not None else CAPTION_BACKOFF_BASE * 2**attempt
+            delay = delay * random.uniform(1.0, 1.25)
+            if waited + delay > max_total_wait:
+                raise
+            status = "429" if _is_429(e) else "a transient error"
+            print(f"  caption fetch got {status}, retrying in {delay:.0f}s ({attempt + 1}/{retries})", file=sys.stderr)
+            sleep(delay)
+            waited += delay
+
+
 def get_captions(url, lang, tmp):
-    """Return (info, segments|None). segments = [(start_sec, text)]."""
+    """Return (info, segments|None). segments = [(start_sec, text)].
+
+    Raises CaptionTransientError when no caption file was written because the
+    download hit HTTP 429 / 5xx (yt-dlp only warns about that).
+    """
+    log = _WarningLog()
     opts = {
         "skip_download": True,
         "writesubtitles": True,
@@ -54,11 +180,15 @@ def get_captions(url, lang, tmp):
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "logger": log,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     files = sorted(tmp.glob(f"{info['id']}*.json3"))
     if not files:
+        bad = [w for w in log.warnings if _TRANSIENT_RE.search(w)]
+        if bad:
+            raise CaptionTransientError(bad[-1])
         return info, None
     # prefer manually uploaded captions over auto-generated ones
     manual = set((info.get("subtitles") or {}).keys())
@@ -142,11 +272,20 @@ def main():
     )
     ap.add_argument("--force-whisper", action="store_true", help="skip captions, always use Whisper")
     ap.add_argument("--timestamps", action="store_true")
+    ap.add_argument(
+        "--caption-delay",
+        type=float,
+        default=DEFAULT_CAPTION_DELAY,
+        metavar="SECONDS",
+        help="minimum delay (plus jitter) between caption requests on multi-URL runs "
+        f"(default: {DEFAULT_CAPTION_DELAY:g}; grows after a 429)",
+    )
     ap.add_argument("--out", default="transcripts")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    throttle = Throttle(args.caption_delay)
 
     for url in args.urls:
         print(f"==> {url}", file=sys.stderr)
@@ -175,12 +314,12 @@ def main():
                 info, segs, source = None, None, None
                 if not args.force_whisper:
                     try:
-                        info, segs = get_captions(url, args.lang, tmp)
+                        info, segs = get_captions_with_retry(url, args.lang, tmp, throttle)
                     except Exception as e:  # e.g. HTTP 429 on the caption endpoint
-                        print(f"  caption fetch failed ({e})", file=sys.stderr)
+                        print(f"  caption fetch failed ({e}), falling back to Whisper", file=sys.stderr)
                         segs = None
                     source = "youtube-captions"
-                    if segs is None:
+                    if segs is None and info is not None:
                         print("  no captions found, falling back to Whisper", file=sys.stderr)
                 if segs is None:
                     info, segs = whisper_transcribe(url, args.lang, model_name, tmp)
