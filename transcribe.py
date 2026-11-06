@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["yt-dlp[default]", "faster-whisper", "av<17", "deno"]
+# dependencies = ["yt-dlp[default]", "faster-whisper", "av<17", "deno", "psycopg[binary]>=3.2"]
 # ///
 """YouTube / podcast link -> transcript.
 
@@ -143,10 +143,19 @@ def main():
     ap.add_argument("--force-whisper", action="store_true", help="skip captions, always use Whisper")
     ap.add_argument("--timestamps", action="store_true")
     ap.add_argument("--out", default="transcripts")
+    ap.add_argument("--store", action="store_true",
+                    help="save to Postgres (DATABASE_URL) and enqueue summarize/embed jobs")
+    ap.add_argument("--no-md", action="store_true", help="with --store: skip writing the .md file")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not (args.store and args.no_md):
+        out_dir.mkdir(parents=True, exist_ok=True)
+    conn = None
+    if args.store:
+        import store  # lazy: only needed (and DB only touched) with --store
+
+        conn = store.connect()
 
     for url in args.urls:
         print(f"==> {url}", file=sys.stderr)
@@ -186,10 +195,28 @@ def main():
                     info, segs = whisper_transcribe(url, args.lang, model_name, tmp)
                     source = f"whisper-{model_name}"
             segs = dedupe(segs)
-            path = out_dir / f"{slugify(info['title'])}_{info['id']}.md"
-            header = f"# {info['title']}\n\n- URL: {info.get('webpage_url', url)}\n- Channel: {info.get('uploader', '?')}\n- Source: {source}\n\n"
-            path.write_text(header + to_text(segs, args.timestamps) + "\n")
-            print(f"  saved {path} ({source})", file=sys.stderr)
+            if not (args.store and args.no_md):
+                path = out_dir / f"{slugify(info['title'])}_{info['id']}.md"
+                header = f"# {info['title']}\n\n- URL: {info.get('webpage_url', url)}\n- Channel: {info.get('uploader', '?')}\n- Source: {source}\n\n"
+                path.write_text(header + to_text(segs, args.timestamps) + "\n")
+                print(f"  saved {path} ({source})", file=sys.stderr)
+            if conn:
+                doc_id, created = store.upsert_document(
+                    conn,
+                    source_type="youtube",
+                    external_id=info["id"],
+                    text=to_text(segs, False),  # plain prose; timestamps live in segments
+                    segments=segs,
+                    source_url=info.get("webpage_url", url),
+                    title=info.get("title"),
+                    author=info.get("uploader"),
+                    published_at=store.parse_upload_date(info.get("upload_date")),
+                    language=args.lang,
+                    duration_s=info.get("duration"),
+                    transcript_method=source,
+                    metadata={"channel_id": info.get("channel_id"), "view_count": info.get("view_count")},
+                )
+                print(f"  stored doc#{doc_id} ({'new' if created else 'already present'})", file=sys.stderr)
         except Exception as e:  # keep going on batch runs
             print(f"  FAILED: {e}", file=sys.stderr)
 

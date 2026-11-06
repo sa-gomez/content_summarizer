@@ -7,15 +7,21 @@ Guidance for AI coding agents (and humans) working in this repo.
 **GitHub Issues is the source of truth for tasks:**
 https://github.com/sa-gomez/content_summarizer/issues
 
-Check open issues before starting work, and file new work there rather than in TODO
-comments, TODO files, or this file. Reference the issue number in branch names and PR
-descriptions (e.g. `Closes #3`). If you finish a piece of work and spot follow-ups, open
+Check open issues before starting work, and file new work there rather than in TODO 
+comments or this file. Reference the issue number in branch names and PR descriptions
+(e.g. `Closes #3`).
+
+If you finish a piece of work and spot follow-ups, open
 an issue for each one and say so in the PR.
 
 ## What this project is
 
-Turns links into transcripts: YouTube videos (captions first, Whisper fallback) and podcasts
-(audio -> Whisper). GitHub: https://github.com/sa-gomez/content_summarizer
+Ingests transcripts (YouTube today; podcasts and others planned), stores the raw text in
+Postgres with metadata, generates LLM summaries of several lengths via background workers,
+and supports hybrid keyword + semantic search. GitHub: https://github.com/sa-gomez/content_summarizer
+
+Designs in docs/ directory
+
 
 ## Layout
 
@@ -24,16 +30,30 @@ Turns links into transcripts: YouTube videos (captions first, Whisper fallback) 
 | `transcribe.py` | CLI: URL(s) -> Markdown transcript in `transcripts/`. Runs via `uv` (PEP 723 inline deps, no venv). |
 | `sources.py` | Pluggable non-YouTube sources (`@register`ed classes with `matches` / `resolve`). Apple Podcasts today. |
 | `transcripts/` | Output, one Markdown file per link |
+| `store.py` | Postgres helpers: `connect`, `upsert_document`, `enqueue_job` |
+| `worker.py` | Job worker (`summarize`, `embed`) using `FOR UPDATE SKIP LOCKED` |
+| `search.py` | Hybrid search CLI (keyword + pgvector, reciprocal rank fusion) |
+| `db/migrations/001_init.sql` | Schema; mounted into the Postgres container's init dir |
+| `docker-compose.yml`, `Dockerfile` | `db` (pgvector), `worker`, and `app` (one-off CLI, profile `tools`) |
+| `tests/ingest_fixture.py` | Fixture ingest used for manual end-to-end checks |
 
 ## Running things
 
 ```
 uv run transcribe.py URL [URL ...]       # YouTube or Apple Podcasts link
 uv run transcribe.py URL --model small   # override the Whisper model
+
+docker compose up -d db worker                      # Postgres + worker
+uv run transcribe.py URL --store                    # ingest (needs uv on the host)
+docker compose run --rm app python search.py "q"    # search
+docker compose run --rm app python worker.py --once # drain the queue and exit
+docker compose down -v     
 ```
 
-Needs `uv` (https://docs.astral.sh/uv/). There is no venv to create; dependencies are the
-`# /// script` block at the top of `transcribe.py`.
+Env vars: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `SUMMARIZER=stub|claude`,
+`EMBEDDER=stub|fastembed`. Use the stubs for offline plumbing tests; the stub embedder is
+not semantic.
+
 
 ## How a link is handled
 
@@ -52,11 +72,25 @@ resolved. Check open issues first; several source types are already filed.
 - `av` is pinned `<17`: `faster-whisper` 1.2.1 fails with newer PyAV
   (`open() got an unexpected keyword argument 'metadata_errors'`).
 - YouTube rate-limits caption downloads per video (HTTP 429); the Whisper fallback covers it.
-- Spotify audio is DRM-protected and can't be downloaded.
-- `.claude/worktrees/` is gitignored; don't commit it.
+
+## Invariants (do not break)
+
+- **`documents.text` is immutable.** Raw transcripts are the irreplaceable data. Anything
+  else (summaries, chunks, embeddings) must stay regenerable from it.
+- **Every summary points to its source** via `summaries.document_id` (and
+  `metadata.source_document_id`).
+- **Jobs must be idempotent.** Enqueue with a `dedupe_key`; handlers may run more than once
+  (stale-lock reclaim, retries).
+- **The embedding dimension (384) is fixed in the schema.** Changing the embedding model means
+  a new column/table and re-embedding all chunks.
+- Schema changes go in a new numbered file under `db/migrations/`. The init directory only
+  runs on a fresh database, so existing databases need the file applied by hand until a
+  migration runner exists.
 
 ## Conventions
 
+- Keep `transcribe.py` importing `store` lazily so it works without a database.
 - Commit messages: short imperative summary, then a body explaining why.
-- Verify changes end to end where you can (run the CLI on a real link) and state plainly
-  what was not tested.
+- Verify changes end to end where you can (ingest -> worker -> search) and state plainly what
+  was not tested.
+
