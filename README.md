@@ -19,7 +19,7 @@ keyword + semantic search. Raw text is immutable; summaries/chunks/embeddings ar
     docker compose up -d db worker          # Postgres + job worker (scale: --scale worker=3)
     export ANTHROPIC_API_KEY=...            # workers use Claude for summaries
     uv run transcribe.py URL --store        # also writes .md; add --no-md to skip it
-    docker compose run --rm app python search.py "query" [--kind summary|transcript|short|medium|long] [--mode hybrid|keyword|semantic]
+    docker compose run --rm app python search.py "query" [--kind summary|transcript|micro|short|medium] [--mode hybrid|keyword|semantic]
 
 Schema: `db/migrations/001_init.sql` (documents, segments, summaries -> document_id,
 chunks, jobs). `--store` reads `DATABASE_URL` (default: the compose db on localhost:5432);

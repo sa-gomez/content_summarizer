@@ -39,9 +39,12 @@ minutes is treated as orphaned and reclaimed. Failures retry with exponential ba
 `dedupe_key` makes re-ingesting a video a no-op.
 
 ### Summaries
-Kinds: `short` (~50 words, Haiku), `medium` (~200) and `long` (~600) (Sonnet).
-Transcripts over 60k characters are summarized map-reduce style (section summaries,
-then a summary of those). Each summary row records `model`, `prompt_version` and
+Every document gets three summaries, sized relative to the source word count:
+`micro` (~5%, Haiku), `short` (~15%) and `medium` (~30%) (Sonnet). The exact target
+is stored in `summaries.target_words`. Transcripts over 60k characters are summarized
+map-reduce style: each section is summarized at the kind's ratio, then those are
+summarized to the final target. The prompt version is part of the job dedupe key, so
+bumping `PROMPT_VERSION` lets re-ingest enqueue fresh summaries. Each summary row records `model`, `prompt_version` and
 `metadata.source_document_id`.
 
 ## Vector embeddings

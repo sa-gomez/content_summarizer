@@ -33,7 +33,7 @@ CREATE TABLE segments (
 CREATE TABLE summaries (
   id             BIGSERIAL PRIMARY KEY,
   document_id    BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  kind           TEXT NOT NULL,                -- short | medium | long
+  kind           TEXT NOT NULL,                -- micro | short | medium
   target_words   INTEGER,
   model          TEXT NOT NULL,
   prompt_version TEXT NOT NULL,

@@ -16,11 +16,11 @@ import store
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 MAX_ATTEMPTS = 5
 STALE_AFTER = "10 minutes"  # a 'running' job older than this is presumed orphaned
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = store.PROMPT_VERSION
 CHUNK_CHARS, CHUNK_OVERLAP = 1500, 200
 MAP_CHARS = 60_000  # transcripts longer than this are summarized map-reduce style
 
-MODELS = {"short": "claude-haiku-5-5", "medium": "claude-sonnet-5-5", "long": "claude-sonnet-5-5"}
+MODELS = {"micro": "claude-haiku-5-5", "short": "claude-sonnet-5-5", "medium": "claude-sonnet-5-5"}
 
 CLAIM_SQL = """
 UPDATE jobs SET status='running', locked_by=%s, locked_at=now(), attempts=attempts+1
@@ -39,10 +39,12 @@ def _claude(model, system, user, max_tokens):
     import anthropic
 
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
-    msg = client.messages.create(
+    # stream: medium summaries of very long podcasts need max_tokens too large for a plain call
+    with client.messages.stream(
         model=model, max_tokens=max_tokens, system=system,
         messages=[{"role": "user", "content": user}],
-    )
+    ) as stream:
+        msg = stream.get_final_message()
     return "".join(b.text for b in msg.content if b.type == "text").strip()
 
 
@@ -97,17 +99,32 @@ def chunk_text(text):
     return [c for c in chunks if c]
 
 
+def _max_tokens(words):
+    return int(words * 2) + 256  # ~1.3 tokens/word plus headroom
+
+
 def summarize_text(text, kind, title):
-    words = store.SUMMARY_KINDS[kind]
+    """Summarize to SUMMARY_KINDS[kind] of the source length. Returns (model, summary, target_words)."""
+    words = store.target_words(text, kind)
     model = MODELS[kind]
     system = ("You summarize transcripts faithfully. Output only the summary text, "
-              f"about {words} words, no preamble.")
-    if len(text) > MAP_CHARS:  # map: summarize pieces, reduce: summarize the summaries
+              f"about {words} words (a target; stay within 20% of it), no preamble.")
+    if len(text) > MAP_CHARS:
+        # map: summarize each section at this kind's ratio so the reduce step keeps enough
+        # detail; reduce: summarize the concatenated section summaries to the final target.
+        ratio = store.SUMMARY_KINDS[kind]
         pieces = [text[i:i + MAP_CHARS] for i in range(0, len(text), MAP_CHARS)]
-        partials = [llm(MODELS["medium"], "Summarize this transcript section in about 250 words. "
-                        "Output only the summary.", p, 800) for p in pieces]
-        text = "\n\n".join(partials)
-    return model, llm(model, system, f"Title: {title}\n\nTranscript:\n{text}", max(256, words * 3))
+        partials = []
+        for p in pieces:
+            pw = max(10, round(len(p.split()) * ratio))
+            partials.append(llm(MODELS["medium"],
+                                f"Summarize this transcript section in about {pw} words. "
+                                "Output only the summary.", p, _max_tokens(pw)))
+        text_for_llm = "\n\n".join(partials)
+    else:
+        text_for_llm = text
+    return model, llm(model, system, f"Title: {title}\n\nTranscript:\n{text_for_llm}",
+                      _max_tokens(words)), words
 
 
 # ---------- job handlers ----------
@@ -115,13 +132,14 @@ def summarize_text(text, kind, title):
 def do_summarize(conn, payload):
     doc_id, kind = payload["document_id"], payload["kind"]
     title, text = conn.execute("SELECT title, text FROM documents WHERE id=%s", (doc_id,)).fetchone()
-    model, summary = summarize_text(text, kind, title)
+    model, summary, target = summarize_text(text, kind, title)
     row = conn.execute(
         """INSERT INTO summaries (document_id, kind, target_words, model, prompt_version, text, metadata)
            VALUES (%s,%s,%s,%s,%s,%s,%s)
            ON CONFLICT (document_id, kind, model, prompt_version) DO NOTHING RETURNING id""",
-        (doc_id, kind, store.SUMMARY_KINDS[kind], model, PROMPT_VERSION, summary,
-         Jsonb({"source_document_id": doc_id, "source_chars": len(text)})),
+        (doc_id, kind, target, model, PROMPT_VERSION, summary,
+         Jsonb({"source_document_id": doc_id, "source_chars": len(text),
+               "source_words": len(text.split()), "ratio": store.SUMMARY_KINDS[kind]})),
     ).fetchone()
     if row:
         store.enqueue_job(conn, "embed", {"summary_id": row[0]}, f"embed:summary:{row[0]}")

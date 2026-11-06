@@ -1,6 +1,6 @@
 """Hybrid (keyword + semantic) search over transcripts and summaries.
 
-  python search.py "query" [--kind summary|transcript|short|medium|long] [--source youtube]
+  python search.py "query" [--kind summary|transcript|micro|short|medium] [--source youtube]
                    [--limit 10] [--mode hybrid|keyword|semantic]
 
 Keyword rank (ts_rank) and vector rank (pgvector cosine) are merged with
