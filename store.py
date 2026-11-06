@@ -1,0 +1,84 @@
+"""Postgres storage helpers shared by transcribe.py, worker.py and search.py."""
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+
+import psycopg
+from psycopg.types.json import Jsonb
+
+DEFAULT_URL = "postgresql://transcripts:transcripts@localhost:5432/transcripts"
+
+# kind -> target words. Summaries are generated per kind by the worker.
+SUMMARY_KINDS = {"short": 50, "medium": 200, "long": 600}
+
+
+def connect():
+    return psycopg.connect(os.environ.get("DATABASE_URL", DEFAULT_URL), autocommit=False)
+
+
+def enqueue_job(conn, type_, payload, dedupe_key=None):
+    """Insert a job; a repeated dedupe_key is a no-op (idempotent ingest)."""
+    conn.execute(
+        "INSERT INTO jobs (type, payload, dedupe_key) VALUES (%s, %s, %s) "
+        "ON CONFLICT (dedupe_key) DO NOTHING",
+        (type_, Jsonb(payload), dedupe_key),
+    )
+
+
+def upsert_document(conn, *, source_type, external_id, text, segments=None,
+                    kinds=None, **fields):
+    """Insert a document (raw text is immutable: an existing row is left as is).
+
+    Enqueues an embed job and one summarize job per kind. Returns (id, created).
+    `fields` may include source_url, title, author, published_at, language,
+    duration_s, transcript_method, metadata (dict).
+    """
+    kinds = list(SUMMARY_KINDS) if kinds is None else kinds
+    metadata = Jsonb(fields.pop("metadata", None) or {})
+    cols = {k: fields.get(k) for k in (
+        "source_url", "title", "author", "published_at", "language",
+        "duration_s", "transcript_method")}
+    content_hash = hashlib.sha256(text.encode()).hexdigest()
+    row = conn.execute(
+        """INSERT INTO documents (source_type, external_id, text, content_hash, metadata,
+                                  source_url, title, author, published_at, language,
+                                  duration_s, transcript_method)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (source_type, external_id) DO NOTHING
+           RETURNING id""",
+        (source_type, external_id, text, content_hash, metadata, cols["source_url"],
+         cols["title"], cols["author"], cols["published_at"], cols["language"],
+         cols["duration_s"], cols["transcript_method"]),
+    ).fetchone()
+    created = row is not None
+    if created:
+        doc_id = row[0]
+        if segments:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO segments (document_id, ordinal, start_s, text) VALUES (%s,%s,%s,%s)",
+                    [(doc_id, i, start, t) for i, (start, t) in enumerate(segments)],
+                )
+    else:
+        doc_id = conn.execute(
+            "SELECT id FROM documents WHERE source_type=%s AND external_id=%s",
+            (source_type, external_id),
+        ).fetchone()[0]
+    # dedupe keys make re-ingest (and retries) safe
+    enqueue_job(conn, "embed", {"document_id": doc_id}, f"embed:doc:{doc_id}")
+    for kind in kinds:
+        enqueue_job(conn, "summarize", {"document_id": doc_id, "kind": kind},
+                    f"summarize:{doc_id}:{kind}")
+    conn.commit()
+    return doc_id, created
+
+
+def parse_upload_date(s):
+    """yt-dlp upload_date 'YYYYMMDD' -> aware datetime (or None)."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
